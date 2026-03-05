@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Checkpoints and generated artifacts
+checkpoints_*/
+*.pth
+*.pt
+query_class_stats.pth
+class_prototypes.pth
+
+# Visualizations and logs
+*_visualizations/
+*.log
+*.json
+!Eval_benchmark/**/*.json
+
+# IDE and OS
+.idea/
+.vscode/
+.DS_Store
+*.swp
+*~
+
+# Optional: exclude large dataset images if you only want to open-source code
+# Lab Scenes.v2-2026_train_0120.yolov8/
+# vanilla-dataset/
+# Eval_benchmark/

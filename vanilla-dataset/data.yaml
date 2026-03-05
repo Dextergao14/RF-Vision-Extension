@@ -1,0 +1,13 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+nc: 4
+names: ['Concrete', 'Glass', 'Metal', 'Wood']
+
+roboflow:
+  workspace: ieeeicc2025
+  project: ieee-icc-2025
+  version: 5
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/ieeeicc2025/ieee-icc-2025/dataset/5
