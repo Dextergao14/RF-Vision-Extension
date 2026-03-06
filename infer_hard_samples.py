@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """
-对 hard_samples/test 做推理并可视化：绿色虚线框=GT，彩色实线框=预测。
+推理 + 可视化：绿色框=GT，彩色框=已知类预测，紫色框=Unknown。
+Unknown 判定：softmax 仅判断是否为物体，类别由 feature 空间最近原型决定。
+若 max cos < threshold → Unknown。
 """
 
 import torch
@@ -28,16 +30,9 @@ COLORS_BGR = {
 }
 GT_COLOR = (0, 255, 0)
 
-SCORE_THRESHOLDS = [0.25, 0.45, 0.4, 0.4]  # Concrete, Glass, Metal, Wood
+SCORE_THRESHOLDS = [0.25, 0.45, 0.4, 0.4]
 NMS_IOU = 0.1
 BG_THRESHOLD = 0.5
-# Per-class cos sim threshold to own prototype: if below → Unknown
-# Based on Eval_benchmark stats (mean - 2*std as safe margin)
-# Concrete: mean=0.952, std=0.038, min=0.663 → threshold ~0.65
-# Glass:    mean=0.871, std=0.062, min=0.540 → threshold ~0.50
-# Metal:    mean=0.902, std=0.023, min=0.724 → threshold ~0.70
-# Wood:     mean=0.866, std=0.076, min=0.680 → threshold ~0.65
-PROTO_COS_THRESHOLDS = [0.65, 0.50, 0.70, 0.65]  # per-class thresholds
 
 
 def load_model(ckpt_path, device):
@@ -84,7 +79,7 @@ def nms_per_class(boxes, labels, scores, iou_thr):
     if torch_nms is None or len(boxes) == 0:
         return boxes, labels, scores
     keep = []
-    for c in range(5):  # 0-3: known classes, 4: unknown
+    for c in range(5):
         mask = labels == c
         if mask.sum() == 0:
             continue
@@ -103,11 +98,14 @@ def load_prototypes(proto_path, device):
     proto_list = []
     for cls_id in range(4):
         proto_list.append(data['prototypes'][cls_id])
-    prototypes = torch.stack(proto_list).to(device)  # [4, d_model]
-    return prototypes
+    prototypes = torch.stack(proto_list).to(device)
+    cos_stats = data.get('cos_stats', None)
+    return prototypes, cos_stats
 
 
-def infer_and_visualize(model, img_dir, gt_by_file, device, out_dir, prototypes):
+def infer_and_visualize(model, img_dir, gt_by_file, device, out_dir,
+                        prototypes, feat_key, per_class_thresholds):
+    """per_class_thresholds: [4] tensor, 每个类的 cos 下限 (min_cos - margin)。"""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -132,52 +130,41 @@ def infer_and_visualize(model, img_dir, gt_by_file, device, out_dir, prototypes)
 
         with torch.no_grad():
             out = model(inp)
-        logits = out['pred_logits'][0]          # [Q, 5]
-        boxes = out['pred_boxes'][0]            # [Q, 4]
-        feats = out['decoder_features'][0]      # [Q, d_model]
+        logits = out['pred_logits'][0]
+        boxes = out['pred_boxes'][0]
+        feats = out[feat_key][0]
 
         probs = F.softmax(logits, dim=-1)
         bg_scores = probs[:, -1]
         known_probs = probs[:, :-1]
         max_known_scores, max_known_labels = known_probs.max(dim=-1)
 
-        # Cosine similarity to prototypes: [Q, 4]
         feats_norm = F.normalize(feats, dim=-1)
-        cos_sim = feats_norm @ prototypes.T     # [Q, 4]
+        cos_sim = feats_norm @ prototypes.T
+        max_cos, nearest_cls = cos_sim.max(dim=-1)
 
-        # Step 1: find object queries (not background)
+        # Step 1: object detection via softmax
         is_object = bg_scores < BG_THRESHOLD
-
-        # Step 2: among objects, check if known class score is high enough
-        known_mask = torch.zeros_like(max_known_scores, dtype=torch.bool)
+        passes_score = torch.zeros_like(bg_scores, dtype=torch.bool)
         for c in range(4):
-            known_mask |= (max_known_labels == c) & (max_known_scores > SCORE_THRESHOLDS[c])
+            passes_score |= (max_known_labels == c) & (max_known_scores > SCORE_THRESHOLDS[c])
+        detected = is_object & passes_score
 
-        # Step 3: for each known detection, check cos sim to its PREDICTED class prototype
-        # If the feature is far from the predicted class prototype → reclassify as Unknown
-        proto_unknown = torch.zeros_like(known_mask)
-        for c in range(4):
-            cls_mask = known_mask & (max_known_labels == c)
-            if cls_mask.sum() == 0:
-                continue
-            cos_to_cls = cos_sim[:, c]
-            proto_unknown |= cls_mask & (cos_to_cls < PROTO_COS_THRESHOLDS[c])
+        # Step 2: per-class Unknown check — compare max cos to nearest class's threshold
+        per_query_threshold = per_class_thresholds[nearest_cls]  # [Q]
+        is_known = detected & (max_cos >= per_query_threshold)
+        is_unknown = detected & (max_cos < per_query_threshold)
 
-        truly_known = known_mask & ~proto_unknown
-        reclassified_unknown = proto_unknown
+        # Known: class assigned by nearest prototype, score = max cos
+        boxes_known = boxes[is_known]
+        labels_known = nearest_cls[is_known]
+        scores_known = max_cos[is_known]
 
-        # --- Known predictions ---
-        boxes_known = boxes[truly_known]
-        labels_known = max_known_labels[truly_known]
-        scores_known = max_known_scores[truly_known]
+        # Unknown
+        boxes_unknown = boxes[is_unknown]
+        labels_unknown = torch.full((is_unknown.sum().item(),), 4, dtype=torch.long, device=device)
+        scores_unknown = max_cos[is_unknown]
 
-        # --- Unknown predictions ---
-        unk_mask = reclassified_unknown
-        boxes_unknown = boxes[unk_mask]
-        labels_unknown = torch.full((unk_mask.sum().item(),), 4, dtype=torch.long, device=device)
-        scores_unknown = (1.0 - bg_scores[unk_mask])
-
-        # Merge
         if len(boxes_unknown) > 0:
             boxes_v = torch.cat([boxes_known, boxes_unknown], dim=0)
             labels_v = torch.cat([labels_known, labels_unknown], dim=0)
@@ -188,7 +175,7 @@ def infer_and_visualize(model, img_dir, gt_by_file, device, out_dir, prototypes)
         boxes_xyxy = box_cxcywh_to_xyxy(boxes_v)
         boxes_xyxy, labels_v, scores_v = nms_per_class(boxes_xyxy, labels_v, scores_v, NMS_IOU)
 
-        # draw GT
+        # Draw GT
         gts = gt_by_file.get(fname, [])
         for g in gts:
             x1, y1, x2, y2 = [int(v) for v in g['bbox_xyxy']]
@@ -199,7 +186,7 @@ def infer_and_visualize(model, img_dir, gt_by_file, device, out_dir, prototypes)
             cv2.putText(vis, label_gt, (x1 + 2, y1 - 4),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
 
-        # draw predictions
+        # Draw predictions
         for i in range(len(labels_v)):
             bx = boxes_xyxy[i].cpu().numpy()
             x1 = int(bx[0] * ow)
@@ -222,15 +209,37 @@ def infer_and_visualize(model, img_dir, gt_by_file, device, out_dir, prototypes)
         cv2.imwrite(str(out_path), vis)
         print(f"  {fname}: GT={len(gts)}, Known={n_known}, Unknown={n_unknown}")
 
-    print(f"\n✅ 可视化结果已保存到: {out_dir}/")
+    print(f"\n  可视化已保存到: {out_dir}/")
 
 
 def main():
-    import sys
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    ckpt = './checkpoints_material_detection_new_data/checkpoint_best.pth'
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--contrastive', action='store_true')
+    parser.add_argument('--unknown', action='store_true', help='marble samples')
+    parser.add_argument('--brick', action='store_true', help='brick samples')
+    parser.add_argument('--ckpt', type=str, default=None)
+    parser.add_argument('--proto', type=str, default=None)
+    parser.add_argument('--threshold', type=float, default=None,
+                        help='Override unknown threshold (max cos to any proto)')
+    args = parser.parse_args()
 
-    if '--unknown' in sys.argv:
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    if args.contrastive:
+        ckpt = args.ckpt or '../checkpoints_contrastive/checkpoint_best.pth'
+        proto_path = args.proto or './class_prototypes_contrastive.pth'
+        feat_key = 'proj_features'
+    else:
+        ckpt = args.ckpt or './checkpoints_material_detection_new_data/checkpoint_best.pth'
+        proto_path = args.proto or '../class_prototypes.pth'
+        feat_key = 'decoder_features'
+
+    if args.brick:
+        img_dir = './unknown_material_samples_2/train'
+        ann_path = './unknown_material_samples_2/train/_annotations.coco.json'
+        out_dir = './unknown_material_visualizations_brick'
+    elif args.unknown:
         img_dir = './unknown_material_samples/train'
         ann_path = './unknown_material_samples/train/_annotations.coco.json'
         out_dir = './unknown_material_visualizations'
@@ -239,18 +248,35 @@ def main():
         ann_path = './hard_samples/test/_annotations.coco.json'
         out_dir = './hard_samples_visualizations'
 
-    proto_path = './class_prototypes.pth'
-
-    print("📂 加载模型...")
+    print(f"Loading model: {ckpt}")
     model = load_model(ckpt, device)
-    print("📂 加载原型...")
-    prototypes = load_prototypes(proto_path, device)
-    print("📂 加载 GT 标注...")
+    print(f"Loading prototypes: {proto_path}")
+    prototypes, cos_stats = load_prototypes(proto_path, device)
+
+    margin = 0.02
+    if cos_stats:
+        per_class_thresholds = []
+        for c in range(4):
+            s = cos_stats[c]
+            thr = s['min_cos'] - margin
+            per_class_thresholds.append(thr)
+            print(f"  {CLASS_NAMES[c]:10s}: mean={s['mean_cos']:.4f}, std={s['std_cos']:.4f}, "
+                  f"min={s['min_cos']:.4f} -> threshold={thr:.4f}")
+    else:
+        per_class_thresholds = [0.65, 0.50, 0.70, 0.65]
+        print(f"  Using default thresholds: {per_class_thresholds}")
+
+    if args.threshold is not None:
+        per_class_thresholds = [args.threshold] * 4
+        print(f"  Override: all thresholds = {args.threshold:.4f}")
+
+    per_class_thresholds = torch.tensor(per_class_thresholds, device=device)
+
     gt_by_file = load_coco_gt(ann_path)
-    print(f"📊 共 {len(gt_by_file)} 张图, {sum(len(v) for v in gt_by_file.values())} 个 GT 框")
-    print(f"📊 原型余弦阈值(per-class): {PROTO_COS_THRESHOLDS}")
-    print("\n🔍 推理 + 可视化...")
-    infer_and_visualize(model, img_dir, gt_by_file, device, out_dir, prototypes)
+    print(f"GT: {len(gt_by_file)} images, {sum(len(v) for v in gt_by_file.values())} boxes")
+
+    infer_and_visualize(model, img_dir, gt_by_file, device, out_dir,
+                        prototypes, feat_key, per_class_thresholds)
 
 
 if __name__ == '__main__':
